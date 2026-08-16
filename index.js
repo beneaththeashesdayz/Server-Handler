@@ -41,12 +41,16 @@ app.use(express.json({
 app.get('/', (req, res) => res.send('dayz-deploy-service: ok'));
 
 app.post('/webhook', async (req, res) => {
+  console.log('Webhook hit. ref:', req.body && req.body.ref, '| has signature header:', !!req.headers['x-hub-signature-256']);
+
   if (!verifySignature(req)) {
+    console.log('Rejected: signature verification failed');
     return res.status(401).send('bad signature');
   }
 
   const ref = req.body.ref; // e.g. "refs/heads/main"
   if (ref !== `refs/heads/${BRANCH}`) {
+    console.log(`Ignored: push was to ${ref}, watching refs/heads/${BRANCH}`);
     return res.status(200).send(`ignored (push to ${ref}, not ${BRANCH})`);
   }
 
