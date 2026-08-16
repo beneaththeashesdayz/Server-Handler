@@ -55,17 +55,41 @@ app.post('/webhook', async (req, res) => {
 
   const sha = req.body.after;
   const actor = req.body.pusher ? req.body.pusher.name : 'unknown';
+  const changedFiles = collectChangedFiles(req.body.commits);
 
   try {
     await syncRepo();
     await uploadToServer();
-    await notifyDiscord(true, sha, actor);
+    await notifyDiscord(true, sha, actor, null, changedFiles);
     console.log('Deploy succeeded for', sha);
   } catch (err) {
     console.error('Deploy failed:', err);
-    await notifyDiscord(false, sha, actor, err.message);
+    await notifyDiscord(false, sha, actor, err.message, changedFiles);
   }
 });
+
+// GitHub's push payload lists added/removed/modified files per-commit.
+// A push can contain several commits, so this merges them into one
+// deduplicated list, tagged with what happened to each file.
+function collectChangedFiles(commits) {
+  const files = new Map(); // path -> Set of change types
+
+  for (const commit of commits || []) {
+    for (const f of commit.added || [])    addChange(files, f, 'added');
+    for (const f of commit.modified || []) addChange(files, f, 'modified');
+    for (const f of commit.removed || [])  addChange(files, f, 'removed');
+  }
+
+  return [...files.entries()].map(([file, types]) => {
+    const tag = [...types].join('+'); // e.g. "added", "modified+removed"
+    return `${tag}: ${file}`;
+  });
+}
+
+function addChange(map, file, type) {
+  if (!map.has(file)) map.set(file, new Set());
+  map.get(file).add(type);
+}
 
 function verifySignature(req) {
   const secret = process.env.GITHUB_WEBHOOK_SECRET;
@@ -131,20 +155,37 @@ async function uploadToServer() {
   }
 }
 
-async function notifyDiscord(success, sha, actor, errorMessage) {
+async function notifyDiscord(success, sha, actor, errorMessage, changedFiles) {
   const url = process.env.DISCORD_WEBHOOK_URL;
   if (!url) return;
 
   const shortSha = sha ? sha.substring(0, 7) : 'unknown';
-  const content = success
+  const header = success
     ? `✅ DayZ deploy succeeded — commit \`${shortSha}\` by ${actor}. Restart the server from the GTX panel to apply.`
     : `❌ DayZ deploy failed — commit \`${shortSha}\` by ${actor}. Error: ${errorMessage}`;
+
+  const content = header + '\n' + formatChangedFiles(changedFiles);
 
   await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content }),
   });
+}
+
+// Discord messages cap at 2000 chars, so long file lists get truncated
+// with a count of how many more there were.
+function formatChangedFiles(changedFiles) {
+  if (!changedFiles || changedFiles.length === 0) return '';
+
+  const MAX_LINES = 15;
+  const shown = changedFiles.slice(0, MAX_LINES);
+  const remaining = changedFiles.length - shown.length;
+
+  let block = '```\n' + shown.join('\n') + '\n```';
+  if (remaining > 0) block += `_...and ${remaining} more file(s)_`;
+
+  return block;
 }
 
 app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
