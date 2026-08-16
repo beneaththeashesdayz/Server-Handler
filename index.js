@@ -63,8 +63,7 @@ app.post('/webhook', async (req, res) => {
   const changedFiles = collectChangedFiles(req.body.commits);
 
   try {
-    await syncRepo();
-    await uploadToServer();
+    await withTimeout(deployAll(), 90000, 'Overall deploy timed out after 90s');
     await notifyDiscord(true, sha, actor, null, changedFiles);
     console.log('Deploy succeeded for', sha);
   } catch (err) {
@@ -72,6 +71,19 @@ app.post('/webhook', async (req, res) => {
     await notifyDiscord(false, sha, actor, err.message, changedFiles);
   }
 });
+
+async function deployAll() {
+  await syncRepo();
+  await uploadToServer();
+}
+
+function withTimeout(promise, ms, timeoutMessage) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 // GitHub's push payload lists added/removed/modified files per-commit.
 // A push can contain several commits, so this merges them into one
@@ -124,6 +136,8 @@ async function syncRepo() {
   const { owner, repo } = parseOwnerRepo(process.env.REPO_URL);
   const token = process.env.GITHUB_TOKEN;
 
+  console.log('Downloading tarball for', `${owner}/${repo}`, 'branch', BRANCH);
+
   // Start from a clean directory each time — simplest way to guarantee
   // an exact match with the remote, no leftover/renamed files.
   await fs.promises.rm(REPO_DIR, { recursive: true, force: true });
@@ -142,29 +156,60 @@ async function syncRepo() {
   // (owner-repo-<sha>/) — strip: 1 drops that so files land directly
   // in REPO_DIR, matching the mpmissions/ and profiles/ layout.
   await pipeline(response.body, tar.extract({ cwd: REPO_DIR, strip: 1 }));
+  console.log('Tarball extracted to', REPO_DIR);
+}
+
+// DayZ writes live logs into profiles/ while running (.ADM, .RPT, .log).
+// These get locked by the running server process — never try to overwrite
+// them, and they shouldn't be tracked in the repo in the first place.
+const EXCLUDED_EXTENSIONS = ['.adm', '.rpt', '.log'];
+
+function isExcludedFile(itemPath) {
+  return EXCLUDED_EXTENSIONS.includes(path.extname(itemPath).toLowerCase());
 }
 
 async function uploadToServer() {
   const sftp = new SftpClient();
+  console.log('Connecting to SFTP:', process.env.SFTP_HOST, process.env.SFTP_PORT);
+
   await sftp.connect({
     host: process.env.SFTP_HOST,
     port: Number(process.env.SFTP_PORT || 22),
     username: process.env.SFTP_USERNAME,
     password: process.env.SFTP_PASSWORD,
+    readyTimeout: 15000, // fail loudly after 15s instead of hanging forever
   });
+  console.log('SFTP connected');
+
+  const uploadFilter = (itemPath, isDirectory) => {
+    if (isDirectory) return true;
+    const skip = isExcludedFile(itemPath);
+    if (skip) console.log('Skipping runtime file:', itemPath);
+    return !skip;
+  };
 
   try {
     const missionLocal = path.join(REPO_DIR, 'mpmissions');
     const profilesLocal = path.join(REPO_DIR, 'profiles');
 
     if (fs.existsSync(missionLocal)) {
-      await sftp.uploadDir(missionLocal, process.env.REMOTE_MISSION_PATH);
+      console.log('Uploading mission files to', process.env.REMOTE_MISSION_PATH);
+      await sftp.uploadDir(missionLocal, process.env.REMOTE_MISSION_PATH, { filter: uploadFilter });
+      console.log('Mission files uploaded');
+    } else {
+      console.log('No local mpmissions folder found in repo, skipping');
     }
+
     if (fs.existsSync(profilesLocal)) {
-      await sftp.uploadDir(profilesLocal, process.env.REMOTE_PROFILES_PATH);
+      console.log('Uploading profiles to', process.env.REMOTE_PROFILES_PATH);
+      await sftp.uploadDir(profilesLocal, process.env.REMOTE_PROFILES_PATH, { filter: uploadFilter });
+      console.log('Profiles uploaded');
+    } else {
+      console.log('No local profiles folder found in repo, skipping');
     }
   } finally {
     await sftp.end();
+    console.log('SFTP connection closed');
   }
 }
 
