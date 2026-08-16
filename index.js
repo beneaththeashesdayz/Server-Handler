@@ -1,8 +1,8 @@
 // DayZ deploy webhook service — run on Railway.
 //
 // Flow: GitHub push -> webhook hits this server -> verify signature ->
-// git pull the repo -> upload mpmissions/ and profiles/ over SFTP ->
-// notify Discord.
+// download the repo as a tarball via GitHub's API (no git binary needed) ->
+// upload mpmissions/ and profiles/ over SFTP -> notify Discord.
 //
 // Required environment variables (set these in Railway > Variables):
 //   GITHUB_WEBHOOK_SECRET   - a secret string, must match the one you set
@@ -22,7 +22,8 @@
 
 const express = require('express');
 const crypto = require('crypto');
-const simpleGit = require('simple-git');
+const tar = require('tar');
+const { pipeline } = require('stream/promises');
 const SftpClient = require('ssh2-sftp-client');
 const fetch = require('node-fetch');
 const path = require('path');
@@ -112,36 +113,35 @@ function verifySignature(req) {
   }
 }
 
-function authenticatedRepoUrl() {
-  const url = process.env.REPO_URL;
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) return url; // public repo, no token needed
-
-  // Turns https://github.com/user/repo.git into
-  // https://<token>@github.com/user/repo.git
-  return url.replace('https://', `https://${token}@`);
+function parseOwnerRepo(url) {
+  // Accepts https://github.com/owner/repo.git or https://github.com/owner/repo
+  const match = url.match(/github\.com\/([^/]+)\/([^/.]+?)(\.git)?\/?$/);
+  if (!match) throw new Error(`Could not parse owner/repo from REPO_URL: ${url}`);
+  return { owner: match[1], repo: match[2] };
 }
 
 async function syncRepo() {
-  const url = authenticatedRepoUrl();
-  try {
-    if (!fs.existsSync(REPO_DIR)) {
-      await simpleGit().clone(url, REPO_DIR, ['--branch', BRANCH, '--depth', '1']);
-    } else {
-      const git = simpleGit(REPO_DIR);
-      // Update the remote URL each time in case the token was rotated.
-      await git.remote(['set-url', 'origin', url]);
-      await git.fetch();
-      await git.reset(['--hard', `origin/${BRANCH}`]);
-    }
-  } catch (err) {
-    // simple-git's error object embeds the full command, including the
-    // token in the URL — strip it before it hits any log.
-    const token = process.env.GITHUB_TOKEN;
-    let message = err.message || String(err);
-    if (token) message = message.split(token).join('***REDACTED***');
-    throw new Error(message);
+  const { owner, repo } = parseOwnerRepo(process.env.REPO_URL);
+  const token = process.env.GITHUB_TOKEN;
+
+  // Start from a clean directory each time — simplest way to guarantee
+  // an exact match with the remote, no leftover/renamed files.
+  await fs.promises.rm(REPO_DIR, { recursive: true, force: true });
+  await fs.promises.mkdir(REPO_DIR, { recursive: true });
+
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/${BRANCH}`;
+  const headers = { 'User-Agent': 'dayz-deploy-service' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const response = await fetch(apiUrl, { headers, redirect: 'follow' });
+  if (!response.ok) {
+    throw new Error(`GitHub tarball download failed: ${response.status} ${response.statusText}`);
   }
+
+  // GitHub wraps the tarball contents in one top-level folder
+  // (owner-repo-<sha>/) — strip: 1 drops that so files land directly
+  // in REPO_DIR, matching the mpmissions/ and profiles/ layout.
+  await pipeline(response.body, tar.extract({ cwd: REPO_DIR, strip: 1 }));
 }
 
 async function uploadToServer() {
