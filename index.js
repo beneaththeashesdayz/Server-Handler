@@ -1,134 +1,70 @@
-// DayZ deploy webhook service — run on Railway.
-//
-// Flow: GitHub push -> webhook hits this server -> verify signature ->
-// git pull the repo -> upload mpmissions/ and profiles/ over SFTP ->
-// notify Discord.
-//
-// Required environment variables (set these in Railway > Variables):
-//   GITHUB_WEBHOOK_SECRET   - a secret string, must match the one you set
-//                             in GitHub's webhook config
-//   REPO_URL                - e.g. https://github.com/you/your-repo.git
-//   REPO_BRANCH             - defaults to "main"
-//   SFTP_HOST               - from GTX game panel sFTP Info
-//   SFTP_PORT               - from GTX game panel sFTP Info
-//   SFTP_USERNAME           - GTX control panel username
-//   SFTP_PASSWORD           - GTX control panel password
-//   REMOTE_MISSION_PATH     - e.g. /mpmissions/dayzOffline.chernarusplus
-//   REMOTE_PROFILES_PATH    - e.g. /profiles
-//   DISCORD_WEBHOOK_URL     - optional, skip notifications if unset
+# DayZ Deploy Service (Railway)
 
-const express = require('express');
-const crypto = require('crypto');
-const simpleGit = require('simple-git');
-const SftpClient = require('ssh2-sftp-client');
-const fetch = require('node-fetch');
-const path = require('path');
-const fs = require('fs');
+Listens for a GitHub push webhook, pulls your repo, and uploads the
+`mpmissions/` and `profiles/` folders to your GTX DayZ server over SFTP.
+Sends a Discord message when it's done.
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const REPO_DIR = '/tmp/repo';
-const BRANCH = process.env.REPO_BRANCH || 'main';
+## 1. Push this folder to a GitHub repo
 
-// Keep the raw body around so we can verify the GitHub signature.
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+This can be the same repo as your mission files, or a separate small repo
+just for this service — either works, since `REPO_URL` below points at
+wherever your actual mission/profiles files live.
 
-app.get('/', (req, res) => res.send('dayz-deploy-service: ok'));
+## 2. Deploy to Railway
 
-app.post('/webhook', async (req, res) => {
-  if (!verifySignature(req)) {
-    return res.status(401).send('bad signature');
-  }
+1. Go to https://railway.com and create a new project.
+2. Choose "Deploy from GitHub repo" and select this repo.
+3. Railway will detect the Node app automatically (via `package.json`) and
+   build it.
 
-  const ref = req.body.ref; // e.g. "refs/heads/main"
-  if (ref !== `refs/heads/${BRANCH}`) {
-    return res.status(200).send(`ignored (push to ${ref}, not ${BRANCH})`);
-  }
+## 3. Set environment variables
 
-  // Respond immediately so GitHub doesn't time out; do the work after.
-  res.status(202).send('deploy started');
+In Railway: your project → Variables tab → add each of these (see
+`.env.example` for the full list):
 
-  const sha = req.body.after;
-  const actor = req.body.pusher ? req.body.pusher.name : 'unknown';
+- `GITHUB_WEBHOOK_SECRET` — make up a random string, you'll reuse it in step 4
+- `REPO_URL` — the repo with your `mpmissions/` and `profiles/` folders
+- `REPO_BRANCH` — usually `main`
+- `GITHUB_TOKEN` — only needed if that repo is **private**. Generate one at
+  GitHub → Settings → Developer settings → Personal access tokens →
+  Fine-grained tokens, scoped to just this repo with read-only Contents
+  access. Leave unset if the repo is public.
+- `SFTP_HOST`, `SFTP_PORT`, `SFTP_USERNAME`, `SFTP_PASSWORD` — from your GTX
+  game panel's sFTP Info
+- `REMOTE_MISSION_PATH` — e.g. `/mpmissions/dayzOffline.chernarusplus`
+  (adjust for your map)
+- `REMOTE_PROFILES_PATH` — e.g. `/profiles`
+- `DISCORD_WEBHOOK_URL` — optional, from Discord channel Settings →
+  Integrations → Webhooks
 
-  try {
-    await syncRepo();
-    await uploadToServer();
-    await notifyDiscord(true, sha, actor);
-    console.log('Deploy succeeded for', sha);
-  } catch (err) {
-    console.error('Deploy failed:', err);
-    await notifyDiscord(false, sha, actor, err.message);
-  }
-});
+## 4. Get your Railway public URL
 
-function verifySignature(req) {
-  const secret = process.env.GITHUB_WEBHOOK_SECRET;
-  const signature = req.headers['x-hub-signature-256'];
-  if (!secret || !signature || !req.rawBody) return false;
+Railway → Settings → Networking → "Generate Domain". You'll get something
+like `https://dayz-deploy-service-production.up.railway.app`.
 
-  const expected = 'sha256=' + crypto
-    .createHmac('sha256', secret)
-    .update(req.rawBody)
-    .digest('hex');
+## 5. Add the webhook in GitHub
 
-  try {
-    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch {
-    return false; // length mismatch etc.
-  }
-}
+In the repo with your mission/profiles files:
+Settings → Webhooks → Add webhook
 
-async function syncRepo() {
-  if (!fs.existsSync(REPO_DIR)) {
-    await simpleGit().clone(process.env.REPO_URL, REPO_DIR, ['--branch', BRANCH, '--depth', '1']);
-  } else {
-    const git = simpleGit(REPO_DIR);
-    await git.fetch();
-    await git.reset(['--hard', `origin/${BRANCH}`]);
-  }
-}
+- Payload URL: `https://<your-railway-domain>/webhook`
+- Content type: `application/json`
+- Secret: the same string you set as `GITHUB_WEBHOOK_SECRET` in Railway
+- Events: "Just the push event"
 
-async function uploadToServer() {
-  const sftp = new SftpClient();
-  await sftp.connect({
-    host: process.env.SFTP_HOST,
-    port: Number(process.env.SFTP_PORT || 22),
-    username: process.env.SFTP_USERNAME,
-    password: process.env.SFTP_PASSWORD,
-  });
+## 6. Test it
 
-  try {
-    const missionLocal = path.join(REPO_DIR, 'mpmissions');
-    const profilesLocal = path.join(REPO_DIR, 'profiles');
+Push a small change to `mpmissions/` or `profiles/` on the `main` branch.
+Check the Railway logs (Deployments → View Logs) to see it pull and upload.
+You should get a Discord message if you set that up.
 
-    if (fs.existsSync(missionLocal)) {
-      await sftp.uploadDir(missionLocal, process.env.REMOTE_MISSION_PATH);
-    }
-    if (fs.existsSync(profilesLocal)) {
-      await sftp.uploadDir(profilesLocal, process.env.REMOTE_PROFILES_PATH);
-    }
-  } finally {
-    await sftp.end();
-  }
-}
+## Notes
 
-async function notifyDiscord(success, sha, actor, errorMessage) {
-  const url = process.env.DISCORD_WEBHOOK_URL;
-  if (!url) return;
-
-  const shortSha = sha ? sha.substring(0, 7) : 'unknown';
-  const content = success
-    ? `✅ DayZ deploy succeeded — commit \`${shortSha}\` by ${actor}. Restart the server from the GTX panel to apply.`
-    : `❌ DayZ deploy failed — commit \`${shortSha}\` by ${actor}. Error: ${errorMessage}`;
-
-  await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content }),
-  });
-}
-
-app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
+- The server restart is still manual — DayZ won't pick up new files while
+  running. Restart from the GTX game panel after a deploy, or wire up RCON
+  separately if you want that automated too.
+- Railway's filesystem is ephemeral between deploys of *this* service, but
+  since the repo is re-cloned/pulled on every webhook call, that's fine —
+  it always works from a fresh pull.
+- GTX blocks `.DLL/.EXE/.BAT` uploads by default; open a support ticket
+  with them if you need those unblocked.
