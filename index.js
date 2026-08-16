@@ -2,7 +2,8 @@
 //
 // Flow: GitHub push -> webhook hits this server -> verify signature ->
 // download the repo as a tarball via GitHub's API (no git binary needed) ->
-// upload mpmissions/ and profiles/ over SFTP -> notify Discord.
+// upload/delete only the files that changed in this push over SFTP ->
+// notify Discord.
 //
 // Required environment variables (set these in Railway > Variables):
 //   GITHUB_WEBHOOK_SECRET   - a secret string, must match the one you set
@@ -60,21 +61,21 @@ app.post('/webhook', async (req, res) => {
 
   const sha = req.body.after;
   const actor = req.body.pusher ? req.body.pusher.name : 'unknown';
-  const changedFiles = collectChangedFiles(req.body.commits);
+  const changes = collectChangedFiles(req.body.commits); // [{ file, tag }]
 
   try {
-    await withTimeout(deployAll(), 90000, 'Overall deploy timed out after 90s');
-    await notifyDiscord(true, sha, actor, null, changedFiles);
+    await withTimeout(deployAll(changes.map(c => c.file)), 90000, 'Overall deploy timed out after 90s');
+    await notifyDiscord(true, sha, actor, null, changes);
     console.log('Deploy succeeded for', sha);
   } catch (err) {
     console.error('Deploy failed:', err);
-    await notifyDiscord(false, sha, actor, err.message, changedFiles);
+    await notifyDiscord(false, sha, actor, err.message, changes);
   }
 });
 
-async function deployAll() {
+async function deployAll(changedFilePaths) {
   await syncRepo();
-  await uploadToServer();
+  await uploadChangedFiles(changedFilePaths);
 }
 
 function withTimeout(promise, ms, timeoutMessage) {
@@ -97,10 +98,10 @@ function collectChangedFiles(commits) {
     for (const f of commit.removed || [])  addChange(files, f, 'removed');
   }
 
-  return [...files.entries()].map(([file, types]) => {
-    const tag = [...types].join('+'); // e.g. "added", "modified+removed"
-    return `${tag}: ${file}`;
-  });
+  return [...files.entries()].map(([file, types]) => ({
+    file,
+    tag: [...types].join('+'), // e.g. "added", "modified+removed"
+  }));
 }
 
 function addChange(map, file, type) {
@@ -168,7 +169,7 @@ function isExcludedFile(itemPath) {
   return EXCLUDED_EXTENSIONS.includes(path.extname(itemPath).toLowerCase());
 }
 
-async function uploadToServer() {
+async function uploadChangedFiles(changedFilePaths) {
   const sftp = new SftpClient();
   console.log('Connecting to SFTP:', process.env.SFTP_HOST, process.env.SFTP_PORT);
 
@@ -181,35 +182,54 @@ async function uploadToServer() {
   });
   console.log('SFTP connected');
 
-  const uploadFilter = (itemPath, isDirectory) => {
-    if (isDirectory) return true;
-    const skip = isExcludedFile(itemPath);
-    if (skip) console.log('Skipping runtime file:', itemPath);
-    return !skip;
-  };
-
   try {
-    const missionLocal = path.join(REPO_DIR, 'mpmissions');
-    const profilesLocal = path.join(REPO_DIR, 'profiles');
-
-    if (fs.existsSync(missionLocal)) {
-      console.log('Uploading mission files to', process.env.REMOTE_MISSION_PATH);
-      await sftp.uploadDir(missionLocal, process.env.REMOTE_MISSION_PATH, { filter: uploadFilter });
-      console.log('Mission files uploaded');
-    } else {
-      console.log('No local mpmissions folder found in repo, skipping');
-    }
-
-    if (fs.existsSync(profilesLocal)) {
-      console.log('Uploading profiles to', process.env.REMOTE_PROFILES_PATH);
-      await sftp.uploadDir(profilesLocal, process.env.REMOTE_PROFILES_PATH, { filter: uploadFilter });
-      console.log('Profiles uploaded');
-    } else {
-      console.log('No local profiles folder found in repo, skipping');
+    for (const relPath of changedFilePaths) {
+      await syncOneFile(sftp, relPath);
     }
   } finally {
     await sftp.end();
     console.log('SFTP connection closed');
+  }
+}
+
+// Maps a repo-relative path (e.g. "profiles/foo.txt") to its remote
+// counterpart under REMOTE_PROFILES_PATH / REMOTE_MISSION_PATH, uploads it
+// if it still exists locally (added/modified), or deletes it remotely if it
+// doesn't (removed in this push). Anything outside mpmissions/ or profiles/,
+// or matching an excluded extension, is skipped.
+async function syncOneFile(sftp, relPath) {
+  if (isExcludedFile(relPath)) {
+    console.log('Skipping runtime file:', relPath);
+    return;
+  }
+
+  let remoteRoot, subPath;
+  if (relPath.startsWith('mpmissions/')) {
+    remoteRoot = process.env.REMOTE_MISSION_PATH;
+    subPath = relPath.slice('mpmissions/'.length);
+  } else if (relPath.startsWith('profiles/')) {
+    remoteRoot = process.env.REMOTE_PROFILES_PATH;
+    subPath = relPath.slice('profiles/'.length);
+  } else {
+    console.log('Skipping file outside synced folders:', relPath);
+    return;
+  }
+
+  const localFull = path.join(REPO_DIR, relPath);
+  const remoteFull = path.posix.join(remoteRoot, subPath);
+
+  if (fs.existsSync(localFull)) {
+    const remoteDir = path.posix.dirname(remoteFull);
+    await sftp.mkdir(remoteDir, true); // recursive, no-ops if it already exists
+    await sftp.put(localFull, remoteFull);
+    console.log('Uploaded:', relPath, '->', remoteFull);
+  } else {
+    try {
+      await sftp.delete(remoteFull);
+      console.log('Deleted on server (removed from repo):', remoteFull);
+    } catch (err) {
+      console.log('Could not delete on server (may not exist there):', remoteFull, '-', err.message);
+    }
   }
 }
 
@@ -233,12 +253,13 @@ async function notifyDiscord(success, sha, actor, errorMessage, changedFiles) {
 
 // Discord messages cap at 2000 chars, so long file lists get truncated
 // with a count of how many more there were.
-function formatChangedFiles(changedFiles) {
-  if (!changedFiles || changedFiles.length === 0) return '';
+function formatChangedFiles(changes) {
+  if (!changes || changes.length === 0) return '';
 
   const MAX_LINES = 15;
-  const shown = changedFiles.slice(0, MAX_LINES);
-  const remaining = changedFiles.length - shown.length;
+  const lines = changes.map(c => `${c.tag}: ${c.file}`);
+  const shown = lines.slice(0, MAX_LINES);
+  const remaining = lines.length - shown.length;
 
   let block = '```\n' + shown.join('\n') + '\n```';
   if (remaining > 0) block += `_...and ${remaining} more file(s)_`;
