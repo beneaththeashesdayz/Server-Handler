@@ -1,0 +1,5 @@
+# DayZ generates these while the server is running — never commit them.
+# They get locked by the live server process and will break deploys.
+*.ADM
+*.RPT
+*.log
