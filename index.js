@@ -124,14 +124,23 @@ function authenticatedRepoUrl() {
 
 async function syncRepo() {
   const url = authenticatedRepoUrl();
-  if (!fs.existsSync(REPO_DIR)) {
-    await simpleGit().clone(url, REPO_DIR, ['--branch', BRANCH, '--depth', '1']);
-  } else {
-    const git = simpleGit(REPO_DIR);
-    // Update the remote URL each time in case the token was rotated.
-    await git.remote(['set-url', 'origin', url]);
-    await git.fetch();
-    await git.reset(['--hard', `origin/${BRANCH}`]);
+  try {
+    if (!fs.existsSync(REPO_DIR)) {
+      await simpleGit().clone(url, REPO_DIR, ['--branch', BRANCH, '--depth', '1']);
+    } else {
+      const git = simpleGit(REPO_DIR);
+      // Update the remote URL each time in case the token was rotated.
+      await git.remote(['set-url', 'origin', url]);
+      await git.fetch();
+      await git.reset(['--hard', `origin/${BRANCH}`]);
+    }
+  } catch (err) {
+    // simple-git's error object embeds the full command, including the
+    // token in the URL — strip it before it hits any log.
+    const token = process.env.GITHUB_TOKEN;
+    let message = err.message || String(err);
+    if (token) message = message.split(token).join('***REDACTED***');
+    throw new Error(message);
   }
 }
 
